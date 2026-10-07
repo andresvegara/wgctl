@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""Small, dependency-free CLI for devices on an existing WireGuard server."""
+import argparse
+import base64
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+
+
+class Error(Exception):
+    pass
+
+
+def run(*args, data=None):
+    try:
+        result = subprocess.run(args, input=data, text=True, capture_output=True,
+                                timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Error(f"Could not run {args[0]}: {exc}") from exc
+    if result.returncode:
+        # Command errors can contain keys. Do not echo their output.
+        raise Error(f"{' '.join(args[:3])} failed (exit {result.returncode}).")
+    return result.stdout.strip()
+
+
+def warn(message):
+    print(f"wgctl: {message}", file=sys.stderr)
+
+
+def key_ok(value):
+    try:
+        return len(base64.b64decode(value, validate=True)) == 32
+    except (ValueError, TypeError):
+        return False
+
+
+class Config:
+    """Keep original lines; only replace the selected peer's section."""
+    def __init__(self, text=""):
+        self.text = text
+        self.lines = text.splitlines(keepends=True)
+        self.peers = {}
+        self.interface = {}
+        current = None
+        pending = None
+
+        def finish(end):
+            nonlocal current
+            if current is None:
+                return
+            current['end'] = end
+            if current['kind'] == 'peer':
+                key = current['fields'].get('publickey', '')
+                if not key_ok(key):
+                    raise Error("A [Peer] section has a missing or invalid PublicKey.")
+                if key in self.peers:
+                    raise Error("The configuration contains duplicate peer public keys.")
+                self.peers[key] = current
+            else:
+                self.interface = current['fields']
+            current = None
+
+        for index, raw in enumerate(self.lines):
+            line = raw.strip()
+            legacy = re.fullmatch(r'#\s+BEGIN_PEER\s+(\S+).*', line)
+            if legacy:
+                finish(index)
+                pending = (index, legacy[1])
+                continue
+            if re.fullmatch(r'#\s+END_PEER(?:\s+.*)?', line):
+                finish(index + 1)
+                pending = None
+                continue
+            disabled = line.startswith('#~ ')
+            if disabled:
+                line = line[3:].strip()
+            clean = line.split('#', 1)[0].strip()
+            header = re.fullmatch(r'\[(Interface|Peer)\]', clean, re.I)
+            if header:
+                finish(pending[0] if pending else index)
+                current = dict(kind=header[1].lower(), start=pending[0] if pending else index,
+                               end=len(self.lines), fields={}, name=pending[1] if pending else '',
+                               disabled=disabled)
+                pending = None
+                continue
+            if current is None:
+                continue
+            name = re.fullmatch(r'#\s*(?:wgctl-name|Name)\s*=\s*(.+)', line, re.I)
+            if name:
+                current['name'] = name[1].strip()
+            if '=' in clean:
+                field, value = (part.strip() for part in clean.split('=', 1))
+                field = field.lower()
+                if field in ('address', 'allowedips') and field in current['fields']:
+                    value = current['fields'][field] + ',' + value
+                current['fields'][field] = value
+        finish(len(self.lines))
+
+    def replace(self, key, replacement):
+        peer = self.peers[key]
+        return ''.join(self.lines[:peer['start']]) + replacement + ''.join(self.lines[peer['end']:])
+
+    def edit(self, key, action, name=None):
+        if action == 'rm':
+            return self.replace(key, '')
+        peer = self.peers[key]
+        lines = self.lines[peer['start']:peer['end']]
+        if action == 'off':
+            lines = [('#~ ' + line) if line.strip() and not line.lstrip().startswith('#') else line
+                     for line in lines]
+            return self.replace(key, ''.join(lines))
+        if action == 'on':
+            lines = [re.sub(r'^(\s*)#~ ', r'\1', line) for line in lines]
+            return self.replace(key, ''.join(lines))
+        if action != 'rename':
+            raise Error(f"Unsupported device action: {action}")
+        lines = [line for line in lines if not re.match(
+            r'\s*#\s*(?:BEGIN_PEER\b|END_PEER\b|(?:wgctl-name|Name)\s*=)', line, re.I)]
+        header = next(i for i, line in enumerate(lines) if re.match(r'\s*(?:#~ )?\[Peer\]', line, re.I))
+        lines.insert(header + 1, f'# wgctl-name = {name}\n')
+        return self.replace(key, ''.join(lines))
+
+
+def settings(path):
+    if not path.exists():
+        return {}
+    mode = path.stat()
+    if mode.st_uid != 0 or mode.st_mode & 0o022:
+        raise Error(f"{path} must be owned by root and not writable by other users.")
+    values = {}
+    for line in path.read_text().splitlines():
+        parts = shlex.split(line, comments=True)
+        if not parts:
+            continue
+        if len(parts) != 1 or '=' not in parts[0]:
+            raise Error(f"Use simple KEY=value assignments in {path}.")
+        key, value = parts[0].split('=', 1)
+        if key not in ('ENDPOINT', 'IFACE', 'CLIENT_ALLOWED', 'CLIENT_DNS'):
+            raise Error(f"Unknown setting {key} in {path}.")
+        values[key] = value
+    return values
+
+
+def live_peers(iface):
+    lines = run('wg', 'show', iface, 'dump').splitlines()
+    peers = {}
+    for line in lines[1:]:
+        key, psk, endpoint, allowed, handshake, rx, tx, keepalive = line.split('\t')
+        fields = {'publickey': key, 'allowedips': '' if allowed == '(none)' else allowed,
+                  'persistentkeepalive': keepalive}
+        if psk != '(none)':
+            fields['presharedkey'] = psk
+        if endpoint != '(none)':
+            fields['endpoint'] = endpoint
+        peers[key] = dict(fields=fields, handshake=int(handshake), rx=int(rx), tx=int(tx))
+    return peers
+
+
+def allowed(fields):
+    try:
+        return [ipaddress.ip_network(item.strip(), strict=False)
+                for item in fields.get('allowedips', '').split(',') if item.strip()]
+    except ValueError as exc:
+        raise Error("A peer has an invalid AllowedIPs value.") from exc
+
+
+def allocate(config, live):
+    try:
+        addresses = [ipaddress.ip_interface(item.strip())
+                     for item in config.interface.get('address', '').split(',') if item.strip()]
+    except ValueError as exc:
+        raise Error("The server has an invalid Address value.") from exc
+    networks = [address.network for address in addresses if address.version == 4]
+    if not networks:
+        raise Error("Adding devices requires an IPv4 Address in the server configuration.")
+    occupied = [(int(address.ip), int(address.ip)) for address in addresses if address.version == 4]
+    for peer in list(config.peers.values()) + list(live.values()):
+        for network in allowed(peer['fields']):
+            if network.version == 4:
+                occupied.append((int(network.network_address), int(network.broadcast_address)))
+    # Skip whole occupied subnets instead of walking potentially millions of addresses.
+    for network in networks:
+        first = int(network.network_address) + (network.prefixlen < 31)
+        last = int(network.broadcast_address) - (network.prefixlen < 31)
+        candidate = first
+        for start, end in sorted(occupied):
+            if start <= candidate <= end:
+                candidate = end + 1
+        if candidate <= last:
+            server = next(address.ip for address in addresses if address.network == network)
+            return str(ipaddress.IPv4Address(candidate)), str(server)
+    raise Error("There are no free IPv4 addresses in the server's configured subnets.")
+
+
+def endpoint(config, options):
+    host = options.get('ENDPOINT', '')
+    port = config.interface.get('listenport', '')
+    if not host:
+        routes = json.loads(run('ip', '-j', '-4', 'route', 'get', '1.1.1.1'))
+        host = routes[0].get('prefsrc', '') if routes else ''
+        if not host or not ipaddress.ip_address(host).is_global:
+            raise Error("The server's public address cannot be detected. "
+                        "Set ENDPOINT=vpn.example.com in /etc/wgctl.conf.")
+    if any(c.isspace() for c in host) or '#' in host:
+        raise Error("ENDPOINT must be a hostname or IP address, optionally with a port.")
+    if host.startswith('['):
+        match = re.fullmatch(r'\[([^\]]+)\](?::([0-9]+))?', host)
+        if not match:
+            raise Error('Use [IPv6-address]:port for an IPv6 endpoint with a port.')
+        host, explicit_port = match.groups()
+        port = explicit_port or port
+        if ipaddress.ip_address(host).version != 6:
+            raise Error('Bracketed ENDPOINT addresses must be IPv6.')
+    elif host.count(':') == 1:
+        host, port = host.rsplit(':', 1)
+    if ':' in host:
+        if ipaddress.ip_address(host).version != 6:
+            raise Error('ENDPOINT contains an invalid IPv6 address.')
+        host = f'[{host}]'
+    elif not re.fullmatch(r'[A-Za-z0-9_.-]+', host):
+        raise Error('ENDPOINT must contain a valid hostname or IP address.')
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise Error('Use a port from 1 to 65535 in ENDPOINT, or set a fixed ListenPort in the server configuration.')
+    return f'{host}:{port}'
+
+
+def resolve(selector, config, live):
+    keys = set(config.peers) | set(live)
+    matches = set()
+    for key in keys:
+        peer = config.peers.get(key, {})
+        fields = peer.get('fields', live.get(key, {}).get('fields', {}))
+        ips = {str(network.network_address) for network in allowed(fields)
+               if network.prefixlen == network.max_prefixlen}
+        key_matches = selector == key or (len(selector) >= 8 and key.startswith(selector))
+        if selector == peer.get('name') or key_matches or selector in ips:
+            matches.add(key)
+    if not matches:
+        raise Error(f"No device matches '{selector}'. Run wgctl show to see device names and public keys.")
+    if len(matches) > 1:
+        raise Error(f"'{selector}' matches more than one device. Use its full public key.")
+    return matches.pop()
+
+
+def device_state(peer, runtime, up):
+    if peer is None:
+        return 'not_saved'
+    if peer['disabled']:
+        return 'disabled_but_active' if runtime else 'disabled'
+    if runtime is None:
+        return 'not_loaded' if up else 'interface_down'
+    if set(allowed(peer['fields'])) != set(allowed(runtime['fields'])):
+        return 'ip_mismatch'
+    return 'active'
+
+
+def device_rows(iface, config, live, up):
+    for key in sorted(set(config.peers) | set(live), key=lambda k: (config.peers.get(k, {}).get('name', ''), k)):
+        peer = config.peers.get(key)
+        runtime = live.get(key)
+        fields = (peer or runtime)['fields']
+        ips = ','.join(str(n) for n in allowed(fields)) or '-'
+        name = peer['name'] if peer and peer['name'] else 'unknown device'
+        name = ''.join(c if c.isprintable() else '?' for c in name)
+        yield {
+            'interface': iface,
+            'name': name,
+            'ip': ips,
+            'state': device_state(peer, runtime, up),
+            'handshake': runtime['handshake'] if runtime else None,
+            'received_bytes': runtime['rx'] if runtime else None,
+            'sent_bytes': runtime['tx'] if runtime else None,
+            'public_key': key,
+        }
+
+
+def handshake_age(timestamp):
+    if timestamp is None:
+        return '-'
+    if timestamp == 0:
+        return 'never'
+    seconds = max(0, int(time.time()) - timestamp)
+    for unit, size in [('d', 86400), ('h', 3600), ('m', 60), ('s', 1)]:
+        if seconds >= size or size == 1:
+            return f'{seconds // size}{unit} ago'
+
+
+def byte_size(value):
+    if value is None:
+        return '-'
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if value < 1024 or unit == 'TiB':
+            return f'{value:g}{unit}' if unit == 'B' else f'{value:.1f}{unit}'
+        value /= 1024
+
+
+def print_devices(devices, output='table'):
+    if output == 'json':
+        for device in devices:
+            print(json.dumps(device, ensure_ascii=False))
+        return
+    rows = [['INTERFACE', 'NAME', 'ID', 'IP', 'STATE', 'HANDSHAKE', 'RECEIVED', 'SENT']]
+    for device in devices:
+        ips = ','.join(str(n.network_address) if n.prefixlen == n.max_prefixlen else str(n)
+                       for n in allowed({'allowedips': '' if device['ip'] == '-' else device['ip']})) or '-'
+        rows.append([device['interface'], device['name'], device['public_key'][:12], ips,
+                     device['state'], handshake_age(device['handshake']),
+                     byte_size(device['received_bytes']), byte_size(device['sent_bytes'])])
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        print('   '.join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+
+
+def listing(iface, config, live, up):
+    print_devices(device_rows(iface, config, live, up))
+
+
+def peer_text(fields):
+    names = {'publickey': 'PublicKey', 'presharedkey': 'PresharedKey', 'allowedips': 'AllowedIPs',
+             'endpoint': 'Endpoint', 'persistentkeepalive': 'PersistentKeepalive'}
+    return '[Peer]\n' + ''.join(f'{names[key]} = {value}\n' for key, value in fields.items() if key in names)
+
+
+def apply_peer(iface, key, fields):
+    if fields is None:
+        run('wg', 'set', iface, 'peer', key, 'remove')
+        return
+    with tempfile.NamedTemporaryFile(mode='w', prefix='wgctl-') as handle:
+        handle.write(peer_text(fields))
+        handle.flush()
+        run('wg', 'addconf', iface, handle.name)
+
+
+def atomic_write(path, text):
+    fd, temporary = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def restore_change(path, config, iface, key, live):
+    """Attempt both restorations even if one fails."""
+    failures = []
+    try:
+        atomic_write(path, config.text)
+    except OSError:
+        failures.append('the saved configuration could not be restored')
+    try:
+        # Clear fields that a failed update might have partially applied.
+        apply_peer(iface, key, None)
+        if key in live:
+            apply_peer(iface, key, live[key]['fields'])
+    except (Error, OSError):
+        failures.append("the device's live state could not be restored")
+    if failures:
+        raise Error(f"Rollback incomplete: {'; '.join(failures)}. Backup: {path}.bak; check wg show {iface}.")
+
+
+def commit(path, config, text, iface, key, desired, live, up, change_live=True):
+    if config.interface.get('saveconfig', '').lower() == 'true':
+        raise Error(f"Set SaveConfig = false in {path} first; otherwise wg-quick can "
+                    "overwrite saved device names and disabled devices.")
+    if path.is_symlink():
+        raise Error(f"{path} is a symlink. Use a regular configuration file for edits.")
+    if path.read_text() != config.text:
+        raise Error("The configuration changed while wgctl was running. Please try again.")
+    Config(text)  # Validate before changing either disk or the running interface.
+    atomic_write(Path(str(path) + '.bak'), config.text)
+    atomic_write(path, text)
+    if not up:
+        warn(f"{iface} is down. The saved change takes effect when it starts.")
+        return
+    if not change_live:
+        return
+    try:
+        apply_peer(iface, key, desired)
+    except (Error, OSError) as exc:
+        try:
+            restore_change(path, config, iface, key, live)
+        except Error as restore_error:
+            raise Error(f'{exc} {restore_error}') from exc
+        raise Error(f"{exc} The previous configuration was restored.") from exc
+
+
+def valid_name(name, config, except_key=None):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', name):
+        raise Error('Use a name with 1–32 letters, numbers, hyphens or underscores.')
+    if any(peer['name'] == name and key != except_key for key, peer in config.peers.items()):
+        raise Error(f"A device named '{name}' already exists.")
+
+
+def private_stdout():
+    if stat.S_ISREG(os.fstat(sys.stdout.fileno()).st_mode):
+        os.fchmod(sys.stdout.fileno(), 0o600)
+
+
+def add(args, path, config, live, up, options):
+    valid_name(args.name, config)
+    address, server = allocate(config, live)
+    remote = endpoint(config, options)
+    if args.full and Path('/proc/sys/net/ipv4/ip_forward').read_text().strip() != '1':
+        raise Error('This server does not forward IPv4 traffic. Set up VPN internet access before using --full.')
+    routes = options.get('CLIENT_ALLOWED') or server + '/32'
+    if args.full:
+        # Capture IPv6 too, preventing it from bypassing an IPv4-only tunnel.
+        routes = '0.0.0.0/0, ::/0'
+    allowed({'allowedips': routes})
+    private = run('wg', 'genkey')
+    public = run('wg', 'pubkey', data=private + '\n')
+    psk = run('wg', 'genpsk')
+    server_public = run('wg', 'pubkey', data=config.interface.get('privatekey', '') + '\n')
+    fields = {'publickey': public, 'presharedkey': psk, 'allowedips': address + '/32'}
+    client = f'[Interface]\nPrivateKey = {private}\nAddress = {address}/32\n'
+    dns = options.get('CLIENT_DNS') or ('1.1.1.1' if args.full else '')
+    if dns:
+        client += f'DNS = {dns}\n'
+    client += (f'\n[Peer]\nPublicKey = {server_public}\nPresharedKey = {psk}\n'
+               f'Endpoint = {remote}\nAllowedIPs = {routes}\nPersistentKeepalive = 25\n')
+    text = config.text.rstrip() + f'\n\n# BEGIN_PEER {args.name}\n' + peer_text(fields) + f'# END_PEER {args.name}\n'
+    private_stdout()
+    # Prepare QR before committing so missing/broken qrencode cannot lose the config.
+    qr = ''
+    if sys.stdout.isatty() and shutil.which('qrencode'):
+        try:
+            qr = run('qrencode', '-t', 'ansiutf8', data=client)
+        except Error:
+            pass
+    commit(path, config, text, args.interface, public, fields, live, up)
+    print(client, end='')
+    if qr:
+        print('\n' + qr)
+    warn(f"Added {args.name} ({address}). Save this configuration; its private key is not stored on the server.")
+
+
+def parser():
+    p = argparse.ArgumentParser(
+        description='Manage devices on an existing WireGuard server. Defaults to show.',
+        epilog='Keywords accept ip-style prefixes: sh, se, a, del, d for dev. '
+               'Example: wgctl se phone down dev wg0. Use s for show and se for set.')
+    p.add_argument('-j', '-json', '--json', dest='output', action='store_const', const='json',
+                   help='show devices as one JSON object per line')
+    p.set_defaults(output='table', interface=None)
+    commands = p.add_subparsers(dest='command')
+    show = commands.add_parser('show', help='show all devices, including existing and unnamed peers')
+    show.add_argument('-j', '-json', '--json', dest='output', action='store_const', const='json',
+                      default=argparse.SUPPRESS, help='show devices as one JSON object per line')
+    add_dev_arguments(show)
+    create = commands.add_parser('add', help='create a device and print its configuration (and QR when available)')
+    create.add_argument('name')
+    create.add_argument('--full', action='store_true',
+                        help='route internet traffic through an already configured VPN gateway')
+    add_dev_arguments(create)
+    update = commands.add_parser('set', help='change a device name or access state')
+    update.add_argument('device', help='name, IP address or ID from show')
+    operations = update.add_subparsers(dest='operation', required=True)
+    for operation, action, help_text in [('up', 'on', 'enable access'), ('down', 'off', 'disable access'),
+                                         ('name', 'rename', 'change the device name')]:
+        sub = operations.add_parser(operation, help=help_text)
+        sub.set_defaults(action=action)
+        if operation == 'name':
+            sub.add_argument('name')
+        add_dev_arguments(sub)
+    delete = commands.add_parser('delete', help='permanently remove a device')
+    delete.add_argument('device', help='name, IP address or ID from show')
+    delete.set_defaults(action='rm')
+    add_dev_arguments(delete)
+    archive = commands.add_parser('backup', help='write a backup to stdout: wgctl backup > wg.tgz')
+    add_dev_arguments(archive)
+    return p
+
+
+def add_dev_arguments(command):
+    command.add_argument('dev', nargs='?', choices=('dev',), help='select a WireGuard interface')
+    command.add_argument('interface', nargs='?', metavar='INTERFACE', help='interface name after dev')
+
+
+def expand_keyword(value, keywords):
+    """Match prefixes in priority order, as ip does (s means show, se means set)."""
+    if not value:
+        return value
+    return next((keyword for keyword in keywords if keyword.startswith(value)), value)
+
+
+def normalize_args(argv):
+    """Expand grammar keywords only; never expand device names or values."""
+    argv = list(argv)
+    index = 0
+    while index < len(argv) and argv[index] in ('-j', '-json', '--json'):
+        index += 1
+    if index == len(argv) or argv[index].startswith('-'):
+        return argv
+    command = expand_keyword(argv[index], ('show', 'list', 'set', 'add', 'delete', 'backup', 'help'))
+    if command == 'help':
+        argv[index] = '--help'
+        return argv
+    if command == 'list':
+        command = 'show'
+    argv[index] = command
+    positions = [i for i in range(index + 1, len(argv)) if not argv[i].startswith('-')]
+    required = {'show': 0, 'add': 1, 'delete': 1, 'backup': 0}.get(command)
+    if command == 'set':
+        if len(positions) < 2:
+            return argv
+        operation_index = positions[1]
+        operation = expand_keyword(argv[operation_index], ('up', 'down', 'name'))
+        argv[operation_index] = operation
+        required = 3 if operation == 'name' else 2
+    if required is None or len(positions) <= required:
+        return argv
+    dev_index = positions[required]
+    argv[dev_index] = expand_keyword(argv[dev_index], ('dev',))
+    return argv
+
+
+def parse_args(argv):
+    cli = parser()
+    args = cli.parse_args(normalize_args(argv))
+    args.command = args.command or 'show'
+    if getattr(args, 'dev', None) and not args.interface:
+        cli.error('dev requires an interface name, for example: dev wg0')
+    if args.output == 'json' and args.command != 'show':
+        cli.error('-j/--json is only available with show')
+    return args
+
+
+def require_root(argv):
+    if os.geteuid() == 0:
+        return
+    if not shutil.which('sudo'):
+        raise Error('Root privileges are required. Run wgctl with sudo.')
+    os.execvp('sudo', ['sudo', '--', sys.executable, str(Path(__file__).resolve()), *argv])
+
+
+def discover(args, options):
+    root = Path('/etc/wireguard')
+    active = set(run('wg', 'show', 'interfaces').split())
+    saved = {path.stem: path for path in root.glob('*.conf')}
+    selected = args.interface or options.get('IFACE')
+    interfaces = [selected] if selected else sorted(active | set(saved))
+    if not interfaces:
+        raise Error('No WireGuard interfaces found. Set up a WireGuard server first.')
+    if selected and selected not in active and selected not in saved:
+        raise Error(f"WireGuard interface '{selected}' was not found.")
+    if args.command != 'show' and len(interfaces) != 1:
+        raise Error(f"Choose an interface with dev {interfaces[0]}. "
+                    f"Available: {', '.join(interfaces)}")
+    return interfaces, saved, active
+
+
+def backup(path):
+    if sys.stdout.isatty():
+        raise Error('Redirect the backup to a file: wgctl backup > wg.tgz')
+    private_stdout()
+    with tarfile.open(fileobj=sys.stdout.buffer, mode='w|gz') as archive:
+        archive.add(path, arcname=str(path).lstrip('/'))
+        if Path('/etc/wgctl.conf').exists():
+            archive.add('/etc/wgctl.conf', arcname='etc/wgctl.conf')
+
+
+def edit_device(args, path, config, live, up):
+    key = resolve(args.device, config, live)
+    if key not in config.peers:
+        raise Error('This device is active but not saved. Save it in the server configuration before editing it.')
+    if args.action == 'rename':
+        valid_name(args.name, config, key)
+    text = config.edit(key, args.action, getattr(args, 'name', None))
+    desired = config.peers[key]['fields'] if args.action == 'on' else None
+    if desired:
+        networks = set(allowed(desired))
+        if any(networks & set(allowed(peer['fields']))
+               for other_key, peer in live.items() if other_key != key):
+            raise Error('Another active device owns the same AllowedIPs prefix. '
+                        'Resolve the conflict before enabling this device.')
+    commit(path, config, text, args.interface, key, desired, live, up, args.action != 'rename')
+    states = {'off': 'disabled', 'on': 'enabled', 'rm': 'removed', 'rename': 'renamed'}
+    message = f'{args.device}: {states[args.action]}'
+    if args.action == 'rename':
+        message += f' to {args.name}'
+    print(message)
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    args = parse_args(argv)
+    require_root(argv)
+    os.umask(0o077)
+    options = settings(Path('/etc/wgctl.conf'))
+    with open('/run/wgctl.lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Error('Another wgctl command is running. Please try again.') from exc
+        interfaces, saved, active = discover(args, options)
+        if args.command == 'show':
+            devices = []
+            for iface in interfaces:
+                path = saved.get(iface)
+                config = Config(path.read_text() if path else '')
+                up = iface in active
+                live = live_peers(iface) if up else {}
+                devices.extend(device_rows(iface, config, live, up))
+            print_devices(devices, args.output)
+            return
+        args.interface = interfaces[0]
+        path = saved.get(args.interface)
+        if path is None:
+            raise Error(f"{args.interface} has no file in /etc/wireguard. "
+                        "Save its server configuration before editing devices.")
+        if args.command == 'backup':
+            backup(path)
+            return
+        config = Config(path.read_text())
+        up = args.interface in active
+        live = live_peers(args.interface) if up else {}
+        if args.command == 'add':
+            add(args, path, config, live, up, options)
+            return
+        edit_device(args, path, config, live, up)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (Error, OSError, ValueError) as exc:
+        warn(str(exc))
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
